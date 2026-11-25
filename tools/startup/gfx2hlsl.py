@@ -401,6 +401,20 @@ def check_encoding(code, off, n, name, asm):
             operand = fields[i + 1]
             fields[i + 1] = operand[:len(operand) - len(operand.lstrip())] + '0x%08x' % (bits ^ 0x80000000)
             asm = ','.join(fields)
+    if n >= 8 and struct.unpack_from('<I', code, off)[0] >> 26 == 0b110101:
+        # VOP3 NEG (w1[31:29], bit 29 + i for source i) on a non-negative inline integer (128..192) or a literal (255).
+        # The decoder prints inline 1 with NEG as `-1`, the text of the plain inline -1 (193), so both would translate to
+        # 0xffffffff, and a literal 5 would become 0xfffffffb. Only v_cndmask_b32_e64 models NEG on its two data
+        # sources (above, as the sign bit flipped). Inline floats, registers and negative inlines are not affected.
+        # ABS is not tested: on the VOP3b forms w0[10:8] is SDST, not a modifier.
+        word1, = struct.unpack_from('<I', code, off + 4)
+        for i in range(3):
+            if name == 'v_cndmask_b32_e64' and i < 2 or not word1 & (1 << (29 + i)):
+                continue
+            source = (word1 >> (9 * i)) & 0x1ff
+            if 128 <= source <= 192 or source == 255:
+                raise Unsupported('%s with NEG on an integer or literal source %d: the printed sign would read as inline -N'
+                                  % (name, i))
     return asm
 
 
