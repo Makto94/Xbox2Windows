@@ -3577,6 +3577,9 @@ register defined in one arm only, and scalar ALU on the joined registers.
 `tests/mesh_join_descriptor_check.py` checks the lowering and these refusals
 in pure Python and, with `<dxc> <renderer> <adapter>`, draws both arms and the
 null arm on D3D12 against the mesh export trace and a pixel reference.
+Reversing the two descriptor arms and changing `s_cbranch_scc0` to
+`s_cbranch_scc1` preserves the image. One input selects vertex depth 1.625
+and clips the entire triangle; the other table would give a visible depth of 0.5.
 The Linux run covers only the Python part; the D3D12 draw runs on Windows.
 
 ```sh
@@ -9208,6 +9211,12 @@ translated pair, so the dispatch stays unforwarded.
 The request fixture checks paired and mesh-only requests, duplicate
 publication, a mismatched root, a populated vertex slot, and an incomplete
 pixel span.
+
+The `startup_mesh57_skeleton_exchange_` tests pass the same source-built
+shader pair through the guest request publisher. The offline reader checks
+the published bytes and key, compiles the recorded pair with its serialized
+root, and compares all 1,024 desktop readback pixels with the CPU reference.
+The one-pixel negative control uses that same published pair.
 
 The pending scan checks the DXContainer header and file length for both
 slot 57 bytecode artifacts. A missing or truncated artifact leaves the
