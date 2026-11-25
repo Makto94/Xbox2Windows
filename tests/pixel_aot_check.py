@@ -19141,6 +19141,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
     fixtures.append((title_program(), translate_title))
     fixtures.append((uncompressed_export(TITLE_X2_BODY), translate_title))
+    fixtures.extend((uncompressed_export(body), translate_title) for body in TITLE_X4_BODIES.values())
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_PLAIN_BODY), translate_int))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_U32_MOD_BODY), translate_int))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY), translate_int))
@@ -20548,6 +20549,110 @@ def title_x2_controls():
     assert title_x2_words(TITLE_X2_CASES[2], "first")[:2] == (title_word(0, 0x3ff), pixel_aot.TITLE_MISS)
 
 
+# flat_load_dwordx4 and global_load_dwordx4 look up all 16 bytes: the four words come from one range or all read
+# TITLE_MISS. An access across two adjacent ranges is a miss, as for the QWORD. One program per form; its four
+# channels are the four words of one load, at A + 2032 (flat), B - 2048 (global) or, with no offset, at A (flat0): the
+# low-word add of the helper then adds zero, and a carry test that is true on equality would add one to the high word.
+TITLE_X4_BODIES = {
+    "flat": [
+        "v_mov_b32_e32 v20, s44",
+        "v_mov_b32_e32 v21, s45",
+        "v_mov_b32_e32 v22, s46",
+        "v_mov_b32_e32 v23, s47",
+        "flat_load_dwordx4 v[12:15], v[20:21] offset:2032",
+        "s_waitcnt vmcnt(0) lgkmcnt(0)",
+    ],
+    "global": [
+        "v_mov_b32_e32 v20, s44",
+        "v_mov_b32_e32 v21, s45",
+        "v_mov_b32_e32 v22, s46",
+        "v_mov_b32_e32 v23, s47",
+        "global_load_dwordx4 v[12:15], v[22:23], off offset:-2048",
+        "s_waitcnt vmcnt(0) lgkmcnt(0)",
+    ],
+    "flat0": [
+        "v_mov_b32_e32 v20, s44",
+        "v_mov_b32_e32 v21, s45",
+        "v_mov_b32_e32 v22, s46",
+        "v_mov_b32_e32 v23, s47",
+        "flat_load_dwordx4 v[12:15], v[20:21]",
+        "s_waitcnt vmcnt(0) lgkmcnt(0)",
+    ],
+}
+TITLE_X4_OFFSETS = {"flat": 2032, "global": -2048, "flat0": 0}
+TITLE_X4_CASES = (  # effective addresses of the 16 bytes, run through both programs
+    0x2_0000_0000,  # the first 16 bytes of a range
+    0x2_0000_0ff0,  # the last 16 bytes of a range
+    0x2_0000_1ff0,  # the last 16 bytes of the last range, in another slot
+    0x2_0000_0ffc,  # across the adjacent ranges at 0x2_0000_1000, after one word
+    0x2_0000_0ff8,  # after two words
+    0x2_0000_0ff4,  # after three words
+    0x0_0010_00f8,  # a range shorter than the access: two DWORDs inside it, the range ends inside the third
+    0x1_8000_0000,  # a hole between ranges
+    0x1_0000_01fc,  # flat: A + 2032 carries through the low 32 bits; all 16 bytes inside one range
+    0x0_ffff_fffc,  # global: B - 2048 borrows through the low 32 bits; the 16 bytes cross 2^32 inside one range
+)
+# Wrong references, each with the (case, channel) it changes: the four words reversed, an 8-byte lookup instead of 16,
+# the words accepted up to the end of the first range, and a separate lookup for each word.
+TITLE_X4_MUTATIONS = {"swap": (0, 0), "narrow": (4, 0), "prefix": (4, 0), "separate": (3, 1)}
+
+
+def title_x4_reference(address, mutation=None):
+    """The four words a 16-byte load at address returns; mutation names one wrong reference."""
+    def hit(where, width):
+        for begin, end, slot in TITLE_RANGES:
+            if where % 4 == 0 and begin <= where and where + width <= end:
+                return slot, (where - begin) // 4
+        return None
+
+    miss = [pixel_aot.TITLE_MISS] * 4
+    whole = hit(address, 8 if mutation == "narrow" else 16)
+    words = [title_word(whole[0], whole[1] + k) for k in range(4)] if whole else miss
+    if mutation == "swap":
+        words.reverse()
+    if mutation == "prefix":
+        first = hit(address, 4)
+        same = [hit(address + 4 * k, 4) for k in range(4)]
+        words = [title_word(first[0], first[1] + k) if first and same[k] and same[k][0] == first[0]
+                 else pixel_aot.TITLE_MISS for k in range(4)]
+    if mutation == "separate":
+        words = [title_word(*word) if (word := hit(address + 4 * k, 4)) else pixel_aot.TITLE_MISS for k in range(4)]
+    return tuple(words)
+
+
+def title_x4_constants(segment, address):
+    """The (A, B) constants that put the 16 bytes of the segment's program at address."""
+    base = address - TITLE_X4_OFFSETS[segment]
+    return (0, base) if segment == "global" else (base, 0)
+
+
+def title_x4_controls():
+    """Check that the cases cover a hit, a miss and the straddles, and that each mutation changes its channel."""
+    expected = [title_x4_reference(address) for address in TITLE_X4_CASES]
+    for address in TITLE_X4_CASES:
+        assert address % 4 == 0 and address >= 0x800 and address < 1 << 64
+    miss = (pixel_aot.TITLE_MISS,) * 4
+    assert expected[0] == tuple(title_word(0, k) for k in range(4))
+    assert expected[1] == tuple(title_word(0, 0x3fc + k) for k in range(4))
+    assert expected[2] == tuple(title_word(3, 0x3fc + k) for k in range(4))
+    assert expected[3] == expected[4] == expected[5] == expected[6] == expected[7] == miss
+    assert expected[8] == tuple(title_word(2, 0x27f + k) for k in range(4))
+    assert expected[9] == tuple(title_word(2, 0x1ff + k) for k in range(4))
+    assert TITLE_X4_OFFSETS["flat0"] == 0 and title_x4_constants("flat0", TITLE_X4_CASES[0])[0] == TITLE_X4_CASES[0]
+    # The carry and the borrow really happen: A + 2032 overflows the low word, and B - 2048 underflows it.
+    a, _ = title_x4_constants("flat", TITLE_X4_CASES[8])
+    _, b = title_x4_constants("global", TITLE_X4_CASES[9])
+    assert (a & 0xffffffff) + TITLE_X4_OFFSETS["flat"] > 0xffffffff
+    assert (b & 0xffffffff) + TITLE_X4_OFFSETS["global"] < 0
+    for mutation, (index, channel) in TITLE_X4_MUTATIONS.items():
+        assert title_x4_reference(TITLE_X4_CASES[index], mutation)[channel] != expected[index][channel], mutation
+    # The words before a straddle are hits for the prefix and for the separate lookup, and all misses for the load.
+    assert title_x4_reference(TITLE_X4_CASES[4], "prefix") == (title_word(0, 0x3fe), title_word(0, 0x3ff)) + miss[:2]
+    assert title_x4_reference(TITLE_X4_CASES[3], "separate") == (title_word(0, 0x3ff), title_word(3, 0), title_word(3, 1),
+                                                                 title_word(3, 2))
+    assert title_x4_reference(TITLE_X4_CASES[6], "prefix") == (title_word(1, 0x3e), title_word(1, 0x3f)) + miss[:2]
+
+
 def translate_title(instructions):
     """translate_int() with the TITLE_RANGES table bound for flat and global loads."""
     return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
@@ -20595,14 +20700,14 @@ def check_title_load_x2_controls():
         return [line if entry == flat else entry for entry in program]
 
     # Wider and narrower neighbours, cache-policy bits, saddr, LDS and out-of-range offsets stay refused.
-    for neighbour in ("flat_load_dwordx3 v[12:14], v[20:21]", "flat_load_dwordx4 v[12:15], v[20:21]",
+    for neighbour in ("flat_load_dwordx3 v[12:14], v[20:21]",
                       "flat_load_dwordx2 v[12:13], v[20:21] glc", "flat_load_dwordx2 v[12:13], v[20:21] slc",
                       "flat_load_dwordx2 v[12:13], v[20:21] offset:8 glc slc dlc",
                       "flat_load_dwordx2 v[12:13], v[20:21] dlc", "global_load_dwordx2 v[12:13], v[20:21], off glc",
                       "global_load_dwordx2 v[12:13], v[20:21], off slc", "global_load_dwordx2 v[12:13], v[20:21], off dlc",
                       "global_load_dwordx2 v[12:13], v20, s[44:45]", "global_load_dwordx2 v[12:13], v20, s[44:45] offset:-8",
                       "global_load_dwordx2 v[12:13], v[20:21], off lds", "global_load_dwordx3 v[12:14], v[20:21], off",
-                      "global_load_dwordx4 v[12:15], v[20:21], off", "flat_load_ubyte v12, v[20:21]", "flat_load_sshort v12, v[20:21]",
+                      "flat_load_ubyte v12, v[20:21]", "flat_load_sshort v12, v[20:21]",
                       "flat_load_short_d16 v12, v[20:21]", "global_load_ubyte v12, v[20:21], off",
                       "flat_store_dwordx2 v[20:21], v[12:13]", "global_store_dwordx2 v[20:21], v[12:13], off",
                       "flat_atomic_add_x2 v[12:13], v[20:21], v[14:15] glc",
@@ -20651,8 +20756,142 @@ def check_title_load_x2_controls():
                            "Sample used before vmcnt wait")
 
 
+def check_title_load_x4_controls():
+    title_x4_controls()
+    flat_program = uncompressed_export(TITLE_X4_BODIES["flat"])
+    global_program = uncompressed_export(TITLE_X4_BODIES["global"])
+    x2_program = uncompressed_export(TITLE_X2_BODY)
+
+    def helper(template):
+        return template.format(slots=pixel_aot.TITLE_ALIAS_SLOTS, count=len(TITLE_RANGES), miss=pixel_aot.TITLE_MISS)
+
+    source = translate_title(flat_program)
+    assert source.count("bool TitleLookup(") == 1 and source.count("uint4 title_load_dwordx4(") == 1
+    assert "address, 16, slot, byteOffset" in source and ".Load4(byteOffset)" in source
+    assert source.count("title_load_dwordx4(uint2(") == 1 and "title_load_dword(uint2(" not in source
+    assert "uint2(0x7f0u, 0x0u)" in source
+    # Word k of the load is channel k of the export, in order.
+    assert re.search(r"title(\d+)\.x\);\s+precise float alu\1y = asfloat\(title\1\.y\);\s+precise float alu\1z = "
+                     r"asfloat\(title\1\.z\);\s+precise float alu\1w = asfloat\(title\1\.w\);\s+"
+                     r"return uint4\(asuint\(alu\1x\), asuint\(alu\1y\), asuint\(alu\1z\), asuint\(alu\1w\)\);", source)
+    global_source = translate_title(global_program)
+    assert global_source.count("title_load_dwordx4(uint2(") == 1 and "uint2(0xfffff800u, 0xffffffffu)" in global_source
+    # A helper is emitted only for the widths a program uses, so DWORD and QWORD translations do not change.
+    wide = {2: helper(pixel_aot.TITLE_MEMORY_X2), 4: helper(pixel_aot.TITLE_MEMORY_X4)}
+    dword_source = translate_title(title_program())
+    assert helper(pixel_aot.TITLE_MEMORY) in dword_source and not any(text in dword_source for text in wide.values())
+    x2_source = translate_title(x2_program)
+    assert wide[2] in x2_source and wide[4] not in x2_source and "Load4" not in x2_source
+    assert wide[4] in source and wide[2] not in source and "Load2" not in source
+    mixed = uncompressed_export(TITLE_X4_BODIES["flat"][:-1] + ["global_load_dwordx2 v[16:17], v[22:23], off",
+                                                               TITLE_X4_BODIES["flat"][-1]])
+    mixed_source = translate_title(mixed)
+    assert mixed_source.count(wide[2]) == mixed_source.count(wide[4]) == mixed_source.count("bool TitleLookup(") == 1
+    # Both forms need the same profile and range table as the DWORD loads.
+    expect_value_error(translate_int, flat_program, "Title memory is not bound")
+    expect_value_error(translate_int, global_program, "Title memory is not bound")
+
+    def without_flat_binding(instructions):
+        return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                     integer_export=True, title_ranges=len(TITLE_RANGES))
+
+    expect_value_error(without_flat_binding, flat_program, "Flat loads require the global-only address profile")
+    assert without_flat_binding(global_program).count("title_load_dwordx4(uint2(") == 1
+    flat = "flat_load_dwordx4 v[12:15], v[20:21] offset:2032"
+    start = flat_program.index(flat)
+    wait = flat_program.index("s_waitcnt vmcnt(0) lgkmcnt(0)")
+
+    def replaced(line):
+        return [line if entry == flat else entry for entry in flat_program]
+
+    # The x3 width, cache-policy bits, saddr, LDS, other directions and narrower neighbours stay refused.
+    for neighbour in ("flat_load_dwordx3 v[12:14], v[20:21]", "flat_load_dwordx3 v[12:14], v[20:21] offset:16",
+                      "global_load_dwordx3 v[12:14], v[20:21], off", "global_load_dwordx3 v[12:14], v[20:21], off offset:16",
+                      "flat_load_dwordx4 v[12:15], v[20:21] glc", "flat_load_dwordx4 v[12:15], v[20:21] slc",
+                      "flat_load_dwordx4 v[12:15], v[20:21] offset:16 glc slc dlc", "flat_load_dwordx4 v[12:15], v[20:21] dlc",
+                      "global_load_dwordx4 v[12:15], v[20:21], off glc", "global_load_dwordx4 v[12:15], v[20:21], off slc",
+                      "global_load_dwordx4 v[12:15], v[20:21], off dlc", "global_load_dwordx4 v[12:15], v20, s[44:45]",
+                      "global_load_dwordx4 v[12:15], v20, s[44:45] offset:-8",
+                      "global_load_dwordx4 v[12:15], v[20:21], off lds", "flat_load_ubyte v12, v[20:21]",
+                      "flat_load_short_d16 v12, v[20:21]", "global_load_sbyte v12, v[20:21], off",
+                      "flat_store_dwordx4 v[20:21], v[12:15]", "global_store_dwordx4 v[20:21], v[12:15], off",
+                      "scratch_load_dwordx4 v[12:15], v20, off", "scratch_load_dwordx4 v[12:15], off, s48",
+                      "scratch_store_dwordx4 off, v[12:15], s48 offset:16"):
+        expect_value_error(translate_title, replaced(neighbour), "Unsupported instruction")
+    # The address form and the offset range of each segment, and a destination of the wrong width for the mnemonic.
+    for form in ("flat_load_dwordx4 v12, v[20:21]", "flat_load_dword v[12:15], v[20:21]",
+                 "global_load_dword v[12:15], v[20:21], off", "flat_load_dwordx4 v[12:15], v[20:21] offset:2048",
+                 "flat_load_dwordx4 v[12:15], v[20:21] offset:-16", "flat_load_dwordx4 v[12:15], v[20:21], off",
+                 "global_load_dwordx4 v[12:15], v[20:21]", "global_load_dwordx4 v[12:15], v[20:21], off offset:2048",
+                 "global_load_dwordx4 v[12:15], v[20:21], off offset:-2049"):
+        expect_value_error(translate_title, replaced(form), "load form")
+    for width in ("flat_load_dwordx4 v[12:13], v[20:21]", "flat_load_dwordx4 v[12:14], v[20:21]",
+                  "flat_load_dwordx4 v[12:16], v[20:21]", "flat_load_dwordx2 v[12:15], v[20:21]",
+                  "global_load_dwordx4 v[12:13], v[20:21], off", "global_load_dwordx2 v[12:15], v[20:21], off"):
+        expect_value_error(translate_title, replaced(width), "width mismatch")
+    must_reject(translate_title, replaced("flat_load_dwordx4 v[12:15], v[20:22]"))
+    must_reject(translate_title, replaced("flat_load_dwordx4 v[12:15], v[24:25]"))  # address never written
+    wqm = flat_program.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(translate_title, flat_program[:wqm] + [flat] + flat_program[wqm:], "Invalid title memory load")
+    # The last four VGPRs are a valid destination in both segments; one register further is not.
+    for edge in ("flat_load_dwordx4 v[252:255], v[20:21]", "global_load_dwordx4 v[252:255], v[22:23], off"):
+        edge_program = flat_program[:wait + 1] + [edge, "s_waitcnt vmcnt(0)"] + flat_program[wait + 1:]
+        assert translate_title(edge_program).count("title_load_dwordx4(uint2(") == 2
+    for edge in ("flat_load_dwordx4 v[253:256], v[20:21]", "global_load_dwordx4 v[253:256], v[22:23], off",
+                 "flat_load_dwordx4 v[255:258], v[20:21]"):
+        edge_program = flat_program[:wait + 1] + [edge, "s_waitcnt vmcnt(0)"] + flat_program[wait + 1:]
+        expect_value_error(translate_title, edge_program, "Invalid title memory load")
+    # All four words are ready only after vmcnt covers the load.
+    for replacement in ([], ["s_waitcnt lgkmcnt(0)"], ["s_waitcnt vmcnt(1)"]):
+        must_reject(translate_title, flat_program[:wait] + replacement + flat_program[wait + 1:])
+    assert translate_title(flat_program[:wait] + ["s_waitcnt vmcnt(0)"] + flat_program[wait + 1:]) == source
+    for register in range(12, 16):
+        expect_value_error(translate_title, flat_program[:wait] + [f"v_add_f32_e32 v16, v{register}, v{register}"]
+                           + flat_program[wait:], "Sample used before vmcnt wait")
+    # Each destination register in flight blocks a second load, whatever width and position the second one has.
+    for low in range(9, 16):
+        expect_value_error(translate_title, flat_program[:wait] + [f"flat_load_dwordx4 v[{low}:{low + 3}], v[20:21]"]
+                           + flat_program[wait:], "Invalid title memory load")
+    for register in range(12, 16):
+        expect_value_error(translate_title, flat_program[:wait] + [f"flat_load_dword v{register}, v[20:21]"]
+                           + flat_program[wait:], "Invalid title memory load")
+        expect_value_error(translate_title, flat_program[:start] + [f"flat_load_dword v{register}, v[20:21]"]
+                           + flat_program[start:], "Invalid title memory load")
+    for pair in ("v[11:12]", "v[13:14]", "v[15:16]"):
+        expect_value_error(translate_title, flat_program[:wait] + [f"flat_load_dwordx2 {pair}, v[20:21]"]
+                           + flat_program[wait:], "Invalid title memory load")
+    # The groups next to the destination are free, and a covered load can be loaded over again.
+    for low in (8, 16):
+        free = flat_program[:wait] + [f"flat_load_dwordx4 v[{low}:{low + 3}], v[20:21]"] + flat_program[wait:]
+        assert translate_title(free).count("title_load_dwordx4(uint2(") == 2
+    loaded = flat_program[:wait + 1] + ["flat_load_dwordx4 v[16:19], v[12:13]", "s_waitcnt vmcnt(0)"] + flat_program[wait + 1:]
+    assert translate_title(loaded).count("title_load_dwordx4(uint2(") == 2
+    # A load counts once in vmcnt, not once per word: after vmcnt(1) the older load is ready and the newer is not.
+    older = flat_program[:wait] + ["flat_load_dwordx4 v[16:19], v[20:21]", "s_waitcnt vmcnt(1)"]
+    tail = flat_program[wait + 1:]
+    assert translate_title(older + ["v_add_f32_e32 v24, v12, v15"] + tail).count("title_load_dwordx4(uint2(") == 2
+    for register in range(16, 20):
+        expect_value_error(translate_title, older + [f"v_add_f32_e32 v24, v{register}, v{register}"] + tail,
+                           "Sample used before vmcnt wait")
+    # Three loads, vmcnt(2): only the oldest is ready, which a count per word would not give.
+    three = flat_program[:wait] + ["flat_load_dwordx4 v[16:19], v[20:21]", "flat_load_dwordx4 v[28:31], v[20:21]",
+                                   "s_waitcnt vmcnt(2)"]
+    assert translate_title(three + ["v_add_f32_e32 v24, v12, v15"] + tail).count("title_load_dwordx4(uint2(") == 3
+    for register in (16, 19, 28, 31):
+        expect_value_error(translate_title, three + [f"v_add_f32_e32 v24, v{register}, v{register}"] + tail,
+                           "Sample used before vmcnt wait")
+    # With a DWORD load before the x4 load, vmcnt(1) covers only the DWORD.
+    partial = flat_program[:start] + ["flat_load_dword v10, v[20:21]", flat, "s_waitcnt vmcnt(1)"]
+    tail = flat_program[start + 1:]
+    assert translate_title(partial + ["v_add_f32_e32 v16, v10, v10"] + tail).count("title_load_dword(uint2(") == 1
+    for register in range(12, 16):
+        expect_value_error(translate_title, partial + [f"v_add_f32_e32 v16, v{register}, v{register}"] + tail,
+                           "Sample used before vmcnt wait")
+
+
 def check_title_load_controls():
     check_title_load_x2_controls()
+    check_title_load_x4_controls()
     title_controls()
     program = title_program()
     source = translate_title(program)
@@ -20683,8 +20922,7 @@ def check_title_load_controls():
 
     # Neighbours that stay unsupported: other widths, sub-DWORD and D16 loads, stores, atomics, scratch, the
     # global saddr and LDS forms, cache-policy bits, and offsets outside each segment's assembler range.
-    for neighbour in ("flat_load_dwordx3 v[12:14], v[20:21]",
-                      "flat_load_dwordx4 v[12:15], v[20:21]", "flat_load_ubyte v12, v[20:21]",
+    for neighbour in ("flat_load_dwordx3 v[12:14], v[20:21]", "flat_load_ubyte v12, v[20:21]",
                       "flat_load_sbyte v12, v[20:21]", "flat_load_ushort v12, v[20:21]",
                       "flat_load_sshort v12, v[20:21]", "flat_load_short_d16 v12, v[20:21]",
                       "flat_load_short_d16_hi v12, v[20:21]", "flat_store_dword v[20:21], v12",
@@ -20757,6 +20995,23 @@ def check_title_load_draws(directory, compiler, renderer, backend):
         addresses = TITLE_X2_CASES[index]
         cases += [(case_x2(mutation, addresses, title_x2_words(addresses, mutation)), "mismatch"), cases[index]]
     run_pixel_batch(renderer, backend, shader, cases)
+    # The 16-byte loads: one shader and one batch of 18 draws for each program.
+    title_x4_controls()
+    for segment, body in TITLE_X4_BODIES.items():
+        source = directory / f"title_loads_x4_{segment}.hlsl"
+        shader = directory / f"title_loads_x4_{segment}.cso"
+        source.write_text(translate_title(uncompressed_export(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+        def case_x4(name, address, words):
+            a, b = title_x4_constants(segment, address)
+            return case(f"x4_{segment}_{name}", a, b, words)
+
+        cases = [(case_x4(n, address, title_x4_reference(address)), "pass") for n, address in enumerate(TITLE_X4_CASES)]
+        for mutation, (index, _) in TITLE_X4_MUTATIONS.items():
+            address = TITLE_X4_CASES[index]
+            cases += [(case_x4(mutation, address, title_x4_reference(address, mutation)), "mismatch"), cases[index]]
+        run_pixel_batch(renderer, backend, shader, cases)
     return 0
 
 
