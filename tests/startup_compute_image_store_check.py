@@ -1,4 +1,4 @@
-"""Check 32-bit float compute image stores (2D, unorm and 2D array) from the startup translator."""
+"""Check 32-bit float compute image stores (2D, unorm, 2D array and 3D) from the startup translator."""
 import argparse
 from pathlib import Path
 import struct
@@ -58,6 +58,49 @@ image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY
 s_endpgm
 """
 
+# The 3D store takes x, y and z in three VGPRs, either one contiguous range or a non-contiguous list that
+# uses the NSA (non-sequential address) encoding. Z is 2 in the middle of a four-deep volume and 3 at its
+# end. The data words are the array fixture's. No dispatch is run: the startup runtime refuses a volume
+# UAV with a named reason, so only the translation is pinned here.
+VOLUME_STORE = bytes.fromhex('100f20f0080e0600')  # image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_3D
+VOLUME_STORE_NSA = bytes.fromhex('120f20f0080e06000c0b0000')  # image_store v[14:17], [v8, v12, v11], ... dim:SQ_RSRC_IMG_3D
+CUBE_STORE = bytes.fromhex('180f20f0080e0600')  # image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_CUBE
+VOLUME_Z = {2: bytes.fromhex('8202147e'), 3: bytes.fromhex('8302147e')}  # v_mov_b32_e32 v10, 2 or 3
+VOLUME_Z_V11 = {2: bytes.fromhex('8202167e'), 3: bytes.fromhex('8302167e')}  # v_mov_b32_e32 v11, 2 or 3
+VOLUME_Y_V12 = bytes.fromhex('0c0046d70b020504')  # v_lshl_add_u32 v12, s11, 1, v1
+VOLUME_LINE = 'w0[uint3(v8, v9, v10)] = asfloat(uint4(v14, v15, v16, v17));'
+VOLUME_LINE_NSA = 'w0[uint3(v8, v12, v11)] = asfloat(uint4(v14, v15, v16, v17));'
+VOLUME_SOURCE = """\
+s_mov_b32 s12, s7
+s_mov_b32 s13, 0
+s_load_dwordx8 s[24:31], s[12:13], 0x40
+v_lshl_add_u32 v8, s10, 2, v0
+v_lshl_add_u32 v9, s11, 1, v1
+v_mov_b32_e32 v10, {z}
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v14, 0x3f400000
+v_mov_b32_e32 v15, 0x3e800000
+v_mov_b32_e32 v16, 0x40810000
+v_mov_b32_e32 v17, 0xbf810001
+image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_3D
+s_endpgm
+"""
+VOLUME_SOURCE_NSA = """\
+s_mov_b32 s12, s7
+s_mov_b32 s13, 0
+s_load_dwordx8 s[24:31], s[12:13], 0x40
+v_lshl_add_u32 v8, s10, 2, v0
+v_lshl_add_u32 v12, s11, 1, v1
+v_mov_b32_e32 v11, {z}
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v14, 0x3f400000
+v_mov_b32_e32 v15, 0x3e800000
+v_mov_b32_e32 v16, 0x40810000
+v_mov_b32_e32 v17, 0xbf810001
+image_store v[14:17], [v8, v12, v11], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_3D
+s_endpgm
+"""
+
 
 def pipeline(body):
     return G.ComputePipeline(PREFIX + body + END, root_blob(3), RSRC2, fixture.GROUP)
@@ -69,6 +112,29 @@ def array_program(layer):
 
 def array_pipeline(layer):
     return G.ComputePipeline(array_program(layer), root_blob(3), RSRC2, fixture.GROUP)
+
+
+def volume_program(z):
+    return ARRAY_PROLOGUE + VOLUME_Z[z] + ARRAY_DATA + VOLUME_STORE + ARRAY_END
+
+
+def volume_program_nsa(z):
+    head = ARRAY_PROLOGUE.replace(bytes.fromhex('090046d70b020504'), VOLUME_Y_V12)
+    return head + VOLUME_Z_V11[z] + ARRAY_DATA + VOLUME_STORE_NSA + ARRAY_END
+
+
+def volume_pipeline(z, nsa=False):
+    return G.ComputePipeline((volume_program_nsa if nsa else volume_program)(z), root_blob(3), RSRC2, fixture.GROUP)
+
+
+def volume_store_checked(hlsl, manifest, line, z, z_register):
+    """The translation of a volume store: one typed-UAV write to texel (x, y, z), the bound RWTexture3D and its manifest line."""
+    assert 'RWTexture3D<float4> w0 : register(u0);' in hlsl, hlsl
+    assert 'RWTexture2D' not in hlsl, hlsl
+    assert hlsl.count(line) == 1, (line, hlsl)
+    assert f'{z_register} = 0x{z:08x}u;' in hlsl, hlsl
+    assert 'uav 0 tex3d float table 1 64 channels 4' in manifest.splitlines(), manifest
+    assert 'srv' not in manifest, manifest
 
 
 def array_reference(layer):
@@ -140,6 +206,48 @@ def controls(llvm_mc):
         refused('x, y and layer expected',
                 lambda: pipe.cs.op_image_store(['v[14:17]', address, 's[24:31]'], array_mods))
 
+    # 3D: x, y and z are indexed as uint3 into a RWTexture3D bound as tex3d, for a contiguous and for a
+    # non-contiguous (NSA) address, with z in the middle and at the end of the four-deep range.
+    if llvm_mc:
+        assert assemble(llvm_mc, 'image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_CUBE\n') == CUBE_STORE
+        for z in (2, 3):
+            assert assemble(llvm_mc, VOLUME_SOURCE.format(z=z)) == volume_program(z), z
+            assert assemble(llvm_mc, VOLUME_SOURCE_NSA.format(z=z)) == volume_program_nsa(z), z
+    for z in (2, 3):
+        for nsa, line, z_register in ((False, VOLUME_LINE, 'v10'), (True, VOLUME_LINE_NSA, 'v11')):
+            volume = volume_pipeline(z, nsa)
+            hlsl, manifest = volume.hlsl_cs(), volume.manifest()
+            volume_store_checked(hlsl, manifest, line, z, z_register)
+            # Each control breaks one property the check above pins, and must make it fail.
+            for mutated, why in (
+                (hlsl.replace(line, ''), 'store omitted'),
+                (hlsl.replace(line, line.replace(z_register + ')', z_register + ' + 1u)')), 'z off by one'),
+                (hlsl.replace(line, line.replace('uint3(', 'uint2(').replace(', ' + z_register, '')), 'z dropped'),
+                (hlsl.replace('RWTexture3D', 'RWTexture2DArray'), 'bound as an array'),
+            ):
+                try:
+                    volume_store_checked(mutated, manifest, line, z, z_register)
+                except AssertionError:
+                    continue
+                raise AssertionError('volume store check missed: ' + why)
+    # The stored address is exactly x, y and z, the data four VGPRs, and the mask full: anything else keeps its refusal.
+    volume_mods = ['dmask:0xf', 'dim:SQ_RSRC_IMG_3D']
+    for address in ('v[8:9]', 'v[8:11]', '[v8, v12]'):
+        refused('x, y and z expected',
+                lambda: pipe.cs.op_image_store(['v[14:17]', address, 's[24:31]'], volume_mods))
+    refused('with d16: only 2D images',
+            lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[24:31]'], volume_mods + ['d16']))
+    refused('typed UAV store writes all four channels',
+            lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[24:31]'], ['dmask:0x3', 'dim:SQ_RSRC_IMG_3D']))
+    refused('modifier a16',
+            lambda: pipe.cs.op_image_store(['v[14:17]', 'v[8:10]', 's[24:31]'], volume_mods + ['a16']))
+    refused('four VGPRs expected',
+            lambda: pipe.cs.op_image_store(['v[14:16]', 'v[8:10]', 's[24:31]'], volume_mods))
+    refused('fixed table image descriptor',
+            lambda: pipe.cs.op_image_store(['v[14:17]', 'v[8:10]', 's[28:35]'], volume_mods))
+    refused('full-width VGPR coordinates',
+            lambda: pipe.cs.op_image_store(['v[14:17]', '[v8, v9, s11]', 's[24:31]'], volume_mods))
+
     mods = ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D', 'unorm']
     for data in ('v14', 'v[14:15]', 'v[14:16]', 'v[253:256]'):
         refused('four VGPRs expected', lambda: pipe.cs.op_image_store([data, 'v[8:9]', 's[24:31]'], mods))
@@ -150,15 +258,14 @@ def controls(llvm_mc):
         (fixture.STORE.replace('v[14:17]', 'v[14:15]').replace('dmask:0xf', 'dmask:0x3'),
          '080320f0080e0600', 'typed UAV store writes all four channels'),
         (fixture.STORE.replace('v[8:9]', 'v8') + ' a16', '080f20f0080e0640', 'modifier a16'),
-        (fixture.STORE.replace('v[8:9]', 'v[8:10]').replace('IMG_2D', 'IMG_3D'),
-         '100f20f0080e0600', 'only 2D images'),
+        (fixture.STORE.replace('v[8:9]', 'v[8:10]').replace('IMG_2D', 'IMG_CUBE'),
+         '180f20f0080e0600', 'only 2D images'),
     ):
         instruction = encoded(asm, code)
         refused(reason, lambda: pipeline(instruction))
 
-    # 1D, 3D and cube keep the same refusal with the address count their form would take.
-    for dim, address in (('SQ_RSRC_IMG_1D', 'v8'), ('SQ_RSRC_IMG_3D', 'v[8:10]'),
-                         ('SQ_RSRC_IMG_CUBE', 'v[8:10]')):
+    # 1D and cube keep the same refusal with the address count their form would take.
+    for dim, address in (('SQ_RSRC_IMG_1D', 'v8'), ('SQ_RSRC_IMG_CUBE', 'v[8:10]')):
         refused('only 2D images',
                 lambda: pipe.cs.op_image_store(['v[14:17]', address, 's[24:31]'], ['dmask:0xf', 'dim:' + dim]))
 
@@ -186,7 +293,7 @@ def controls(llvm_mc):
         if offset == 64:
             for body in (read + STORE, STORE + read):
                 refused('used for a load and a store', lambda: pipeline(load + wait + body))
-    print('Compute 32-bit float image_store, unorm, 2D array, EXEC, raw/texture binding order, alias and '
+    print('Compute 32-bit float image_store, unorm, 2D array, 3D, EXEC, raw/texture binding order, alias and '
           'refusal checks passed')
 
 
