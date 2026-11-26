@@ -18,12 +18,19 @@ Still refused: partial `dmask`, `d16`, `a16`, 1D, cube and the pixel stage.
 The startup runtime does not bind a volume UAV. The manifest consumer in
 `src/startup_stubs/d3d12_compute_dispatch.inl` accepts only `tex2d` and `tex2da`
 UAV lines and refuses a `tex3d` line with the reason "an output that is not a
-raw table buffer or a 2D/2D-array float texture". This note therefore pins the
-translation only. No dispatch has been run and no HLSL has been compiled by DXC
-for this form.
+raw table buffer or a 2D/2D-array float texture". The production startup
+path therefore does not execute this form, and nothing here tests startup binding.
+
+The standalone offscreen harness binds a four-deep, three-mip `R32G32B32A32_FLOAT`
+volume UAV itself. `startup_compute_image_store_volume_warp` and `_hardware`
+compile the translated HLSL with DXC and dispatch it there. They store z = 2 (middle) and
+z = 3 (last) for the contiguous and the NSA address, then compare all 4,672 words of
+every depth slice and mip. Omitting the store must differ by 64 words and a z off by one
+by 128 words. A capability skip returns 77.
 
 ```powershell
 python -B tests/startup_compute_image_store_check.py
+ctest --preset dev --no-tests=error -j 1 -R '^startup_compute_image_store_volume_(warp|hardware)$' -V
 ```
 
 The check assembles a contiguous and an NSA program with z = 2 (middle of a

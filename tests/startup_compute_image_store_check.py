@@ -25,6 +25,8 @@ LINE = 'w0[uint2(v8, v9)] = asfloat(uint4(v14, v15, v16, v17));'
 # pin against llvm-mc-15.
 ARRAY_STORE = bytes.fromhex('280f20f0080e0600')  # image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY
 ARRAY_FLAG = 1 << 31  # tests/compute_check.cpp texture_array_flag
+VOLUME_FLAG = ARRAY_FLAG | fixture.FLOAT_TEXTURE_FLAG  # tests/compute_check.cpp texture_volume_flag
+VOLUME_WORDS = 4672
 ARRAY_LAYERS = 4
 ARRAY_VALUES = (0x3f400000, 0x3e800000, 0x40810000, 0xbf810001)
 ARRAY_LINE = 'w0[uint3(v8, v9, v10)] = asfloat(uint4(v14, v15, v16, v17));'
@@ -135,6 +137,27 @@ def volume_store_checked(hlsl, manifest, line, z, z_register):
     assert f'{z_register} = 0x{z:08x}u;' in hlsl, hlsl
     assert 'uav 0 tex3d float table 1 64 channels 4' in manifest.splitlines(), manifest
     assert 'srv' not in manifest, manifest
+
+
+def volume_reference(z):
+    """Initial then expected words of the four-deep, three-mip volume; only mip zero, depth slice `z` is stored to.
+
+    A volume mip is one subresource whose depth halves with each mip (4, 2, 1), so the words are 4,672 where
+    the array has 5,376.
+    """
+    initial, expected = [], []
+    for mip in range(3):
+        for depth in range(ARRAY_LAYERS >> mip):
+            for y in range(8 >> mip):
+                for x in range(32 >> mip):
+                    tag = mip << 16 | depth << 12 | y << 7 | x << 2
+                    sentinels = [0xbf000000 | tag | c for c in range(4)]
+                    initial.extend(sentinels)
+                    if mip == 0 and depth == z and x < 4 * fixture.GROUPS and y < 2:
+                        expected.extend(ARRAY_VALUES)
+                    else:
+                        expected.extend(sentinels)
+    return initial, expected
 
 
 def array_reference(layer):
@@ -372,15 +395,51 @@ def dispatch(directory, compiler, renderer, adapter):
     return 0
 
 
+def dispatch_volume(directory, compiler, renderer, adapter):
+    """Dispatch the translated 3D store on a four-deep volume UAV and compare every depth slice of every mip.
+
+    The standalone offscreen harness binds the volume view itself; the startup runtime does not bind a tex3d
+    UAV, so this exercises the translated HLSL and not the production manifest consumer.
+    """
+    # z = 2 is in the middle of the four depth slices and z = 3 is the last one. Storing one slice off must
+    # change both the wrong slice and the untouched target, so that control differs by 128 words.
+    for z, shift, needle in (
+        (2, '+ 1', 'mip=0 word=2048 expected=3f400000 actual=bf002000'),
+        (3, '- 1', 'mip=0 word=2048 expected=bf002000 actual=3f400000'),
+    ):
+        for nsa in (False, True):
+            initial, expected = volume_reference(z)
+            assert len(initial) == len(expected) == VOLUME_WORDS
+            assert sum(a != b for a, b in zip(initial, expected)) == 64
+            line, z_register = (VOLUME_LINE_NSA, 'v11') if nsa else (VOLUME_LINE, 'v10')
+            source = volume_pipeline(z, nsa).hlsl_cs()
+            assert source.count(line) == 1
+            label = 'z %d%s' % (z, ' NSA' if nsa else '')
+            first_word = z * 1024  # 32 x 8 texels of four words per depth slice
+            cases = (
+                (label + ', full EXEC', source, 0, None),
+                (label + ', omit store', source.replace(line, ''), 64,
+                 'mip=0 word=%d expected=3f400000 actual=%08x' % (first_word, 0xbf000000 | z << 12)),
+                (label + ', one slice off',
+                 source.replace(line, line.replace(z_register + ')', z_register + ' %s)' % shift)), 128, needle),
+            )
+            if draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
+                          selector=fixture.GROUPS | VOLUME_FLAG, compared=VOLUME_WORDS) == 77:
+                return 77
+    return 0
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--llvm-mc')
     mode.add_argument('--dispatch', nargs=3, metavar=('DXC', 'RENDERER', 'ADAPTER'))
+    mode.add_argument('--dispatch-volume', nargs=3, metavar=('DXC', 'RENDERER', 'ADAPTER'))
     args = parser.parse_args()
-    if args.dispatch:
+    if args.dispatch or args.dispatch_volume:
         out = Path(__file__).resolve().parents[1] / 'out'
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out) as tmp:
-            raise SystemExit(dispatch(Path(tmp), *args.dispatch))
+            run = dispatch if args.dispatch else dispatch_volume
+            raise SystemExit(run(Path(tmp), *(args.dispatch or args.dispatch_volume)))
     controls(args.llvm_mc)
